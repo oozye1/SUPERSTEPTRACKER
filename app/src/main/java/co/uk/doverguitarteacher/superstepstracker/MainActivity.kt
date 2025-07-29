@@ -8,6 +8,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.location.Location
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -45,6 +46,7 @@ import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.google.android.gms.location.*
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
@@ -337,51 +339,27 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ---------- Hardware counter handling ----------
-    // ******** FIXED BUG HERE ********
-    // Original code had a race condition where the first step after midnight was lost.
-    // The logic is now separated to handle the date rollover first, then correctly
-    // calculate the new day's steps starting from 1.
     fun onHardwareCounter(totalSinceBoot: Float) {
         viewModelScope.launch {
             val currentKey = todayKey()
-            // Special case: A new day has begun since the last event.
             if (currentKey != cachedTodayKey) {
-                // Perform the rollover, saving the previous day and resetting state.
                 ensureDateRollover()
-
-                // This event is the first step of the new day.
                 val newSteps = 1
-                // The new baseline must be set relative to this first step.
                 counterBase = totalSinceBoot - newSteps.toFloat()
                 counterBaseDate = currentKey
-
-                // Update the state. This also schedules a debounced save.
                 updateSteps(newSteps)
-
-                // Immediately persist the new baseline, as the scheduled save
-                // doesn't handle it.
                 val prefs = ds.data.first()
                 val hist = decodeHistory(prefs[PrefKeys.HISTORY])
                 persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
-
             } else {
-                // Normal operation: it's the same day.
-
-                // If the baseline is missing (e.g., app start), establish it.
                 if (counterBase == null || counterBaseDate != cachedTodayKey) {
                     counterBase = totalSinceBoot - steps.toFloat()
                     counterBaseDate = cachedTodayKey
-                    // Persist the new baseline immediately.
                     val prefs = ds.data.first()
                     val hist = decodeHistory(prefs[PrefKeys.HISTORY])
                     persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
                 }
-
-                // Calculate steps based on the baseline.
                 val calc = (totalSinceBoot - (counterBase ?: 0f)).toInt()
-
-                // If sensor resets (e.g., reboot), 'calc' will be < 'steps'.
-                // Re-align the baseline to avoid losing steps.
                 if (calc < steps) {
                     counterBase = totalSinceBoot - steps.toFloat()
                     counterBaseDate = cachedTodayKey
@@ -389,13 +367,11 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
                     val hist = decodeHistory(prefs[PrefKeys.HISTORY])
                     persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
                 } else {
-                    // Normal step update.
                     updateSteps(calc)
                 }
             }
         }
     }
-
 
     // ---------- State updates ----------
     fun updateSteps(count: Int) {
@@ -442,7 +418,6 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
             delay(1_000) // debounce
             val prefs = ds.data.first()
             val hist = decodeHistory(prefs[PrefKeys.HISTORY])
-            // Save today's steps; distances/calories are derived for today
             persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
         }
     }
@@ -491,7 +466,21 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         get() = weeklyHistory.maxByOrNull { it.steps }
 }
 
-// ------------------------- Activity & sensors -------------------------
+// ------------------------- Activity & sensors + GPS fusion -------------------------
+
+// Fusion state provided to UI via CompositionLocal (no signature changes to your composables)
+data class FusedMetrics(
+    val gpsAccuracyM: Float = Float.NaN,
+    val lastFixAgeMs: Long = Long.MAX_VALUE,
+    val gpsSpeedMps: Double = 0.0,
+    val stepSpeedMps: Double = 0.0,
+    val fusedSpeedMps: Double = 0.0,
+    val gpsDistanceKm: Double = 0.0,
+    val stepDistanceKm: Double = 0.0,
+    val fusedDistanceKm: Double = 0.0
+)
+private val LocalFusedMetrics = staticCompositionLocalOf { FusedMetrics() }
+
 class MainActivity : ComponentActivity(), SensorEventListener {
     private lateinit var sensorManager: SensorManager
     private var stepCounterSensor: Sensor? = null
@@ -518,11 +507,64 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     companion object {
         private const val TAG = "StepCounter"
         private const val PERMISSION_REQUEST_CODE = 1
+        private const val PERMISSION_REQUEST_LOCATION = 2
     }
+
+    // ---- GPS / FusedLocation ----
+    private lateinit var fusedClient: FusedLocationProviderClient
+    private var locationCallback: LocationCallback? = null
+
+    private var lastFixTimeMs = 0L
+    private var lastGoodLocation: Location? = null
+    private var gpsDistanceMeters = 0.0
+    private var fusedDistanceMeters = 0.0
+
+    // Step-derived stride (fixed for this "non-invasive" option)
+    private var strideMeters = 0.762
+
+    // Cadence window
+    private val stepTimestamps = ArrayDeque<Long>()
+    private fun pushStepTs(ts: Long) {
+        stepTimestamps.addLast(ts)
+        val horizon = ts - 8_000L
+        while (stepTimestamps.isNotEmpty() && stepTimestamps.first() < horizon) {
+            stepTimestamps.removeFirst()
+        }
+    }
+    private fun cadenceSpm(now: Long): Double {
+        if (stepTimestamps.size < 2) return 0.0
+        val dt = (stepTimestamps.last() - stepTimestamps.first()).coerceAtLeast(1L).toDouble()
+        val steps = (stepTimestamps.size - 1).toDouble()
+        return steps * 60_000.0 / dt
+    }
+    private fun stepSpeedMps(now: Long): Double {
+        val spm = cadenceSpm(now)
+        if (spm <= 0.0) return 0.0
+        return (spm / 60.0) * strideMeters
+    }
+    private fun gpsWeight(acc: Float, ageMs: Long): Double {
+        val base = when {
+            acc <= 5f  -> 0.85
+            acc <= 10f -> 0.65
+            acc <= 20f -> 0.40
+            else       -> 0.15
+        }
+        val agePenalty = when {
+            ageMs <= 2_000L  -> 1.0
+            ageMs <= 5_000L  -> 0.9
+            ageMs <= 10_000L -> 0.8
+            else             -> 0.6
+        }
+        return (base * agePenalty).coerceIn(0.0, 0.95)
+    }
+
+    // State for UI
+    private val fusedState = mutableStateOf(FusedMetrics())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // Permissions (activity recognition already requested below; add location too)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -532,19 +574,35 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 PERMISSION_REQUEST_CODE
             )
         }
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION
+                ),
+                PERMISSION_REQUEST_LOCATION
+            )
+        }
 
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
         stepCounterSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
         stepDetectorSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
         accelerometerSensor = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
 
+        fusedClient = LocationServices.getFusedLocationProviderClient(this)
+
         Log.d(TAG, "Step Counter available: ${stepCounterSensor != null}")
         Log.d(TAG, "Step Detector available: ${stepDetectorSensor != null}")
         Log.d(TAG, "Accelerometer available: ${accelerometerSensor != null}")
 
         setContent {
-            MaterialTheme {
-                HealthyStepsCounterApp(stepCounterViewModel)
+            CompositionLocalProvider(LocalFusedMetrics provides fusedState.value) {
+                MaterialTheme {
+                    HealthyStepsCounterApp(stepCounterViewModel)
+                }
             }
         }
     }
@@ -567,11 +625,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         lastHardwareCounterEventTime = 0L
         lastHardwareCounterValue = null
         manualStepCount = stepCounterViewModel.steps
+
+        startLocationUpdates()
     }
 
     override fun onPause() {
         Log.d(TAG, "Unregistering sensor listeners")
         sensorManager.unregisterListener(this)
+        stopLocationUpdates()
         super.onPause()
     }
 
@@ -582,16 +643,14 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                 Sensor.TYPE_STEP_COUNTER -> {
                     val totalSinceBoot = it.values[0]
                     val lastVal = lastHardwareCounterValue
-                    // Consider hardware "alive" only if we actually get events (and keep checking freshness)
                     hardwareCounterCandidate = true
                     lastHardwareCounterEventTime = now
                     lastHardwareCounterValue = totalSinceBoot
-
-                    // On the very first event, base is set inside the ViewModel without jumping the count
-                    // Subsequent events will update steps.
                     if (lastVal == null || totalSinceBoot >= lastVal) {
                         stepCounterViewModel.onHardwareCounter(totalSinceBoot)
                     }
+                    // keep fused "step-speed" responsive using cadence window whenever detector not firing
+                    // (cadence window updated mainly by detector or fallback below)
                 }
                 Sensor.TYPE_STEP_DETECTOR -> {
                     if (inManualMode) {
@@ -599,9 +658,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                         stepCounterViewModel.updateSteps(manualStepCount)
                         stepCounterViewModel.updateLastStepTime(now)
                     } else {
-                        // even in hardware mode, keep the "recent activity" feel responsive
                         stepCounterViewModel.updateLastStepTime(now)
                     }
+                    pushStepTs(now)
                 }
                 Sensor.TYPE_ACCELEROMETER -> {
                     val x = it.values[0]; val y = it.values[1]; val z = it.values[2]
@@ -620,11 +679,83 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             lastStepTime = currentTime
             stepCounterViewModel.updateSteps(manualStepCount)
             stepCounterViewModel.updateLastStepTime(currentTime)
+            pushStepTs(currentTime)
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
         Log.d(TAG, "Sensor accuracy changed: ${sensor?.name} = $accuracy")
+    }
+
+    // ---------- GPS ----------
+    @Suppress("MissingPermission")
+    private fun startLocationUpdates() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
+            != PackageManager.PERMISSION_GRANTED
+        ) return
+
+        if (locationCallback == null) {
+            locationCallback = object : LocationCallback() {
+                override fun onLocationResult(result: LocationResult) {
+                    val loc = result.lastLocation ?: return
+                    val now = System.currentTimeMillis()
+                    val acc = loc.accuracy
+                    val ageMs = 0L // callback is fresh
+
+                    val gpsSpeed = if (loc.hasSpeed()) loc.speed.toDouble() else 0.0
+
+                    // GPS segment distance with simple gates to avoid jumps
+                    lastGoodLocation?.let { prev ->
+                        val seg = prev.distanceTo(loc).toDouble()
+                        if (seg.isFinite() && seg >= 0.0 && acc <= 50f && seg <= 100.0) {
+                            gpsDistanceMeters += seg
+                        }
+                    }
+                    lastGoodLocation = loc
+
+                    // Step-derived speed from cadence
+                    val stepSpeed = stepSpeedMps(now)
+
+                    // Weighted fusion
+                    val w = gpsWeight(acc, ageMs)
+                    val fusedSpeed = w * gpsSpeed + (1 - w) * stepSpeed
+
+                    val dtSec = if (lastFixTimeMs == 0L) 1.0
+                    else ((now - lastFixTimeMs) / 1000.0).coerceIn(0.2, 2.5)
+                    fusedDistanceMeters += fusedSpeed * dtSec
+                    lastFixTimeMs = now
+
+                    // Step distance (fixed stride for this mode)
+                    val stepDist = stepCounterViewModel.steps * strideMeters
+
+                    fusedState.value = fusedState.value.copy(
+                        gpsAccuracyM = acc,
+                        lastFixAgeMs = ageMs,
+                        gpsSpeedMps = gpsSpeed,
+                        stepSpeedMps = stepSpeed,
+                        fusedSpeedMps = fusedSpeed,
+                        gpsDistanceKm = gpsDistanceMeters / 1000.0,
+                        stepDistanceKm = stepDist / 1000.0,
+                        fusedDistanceKm = fusedDistanceMeters / 1000.0
+                    )
+                }
+            }
+        }
+
+        val req = LocationRequest.Builder(
+            Priority.PRIORITY_HIGH_ACCURACY,
+            1_000L
+        )
+            .setMinUpdateIntervalMillis(500L)
+            .setMaxUpdateDelayMillis(2_000L)
+            .setWaitForAccurateLocation(false)
+            .build()
+
+        fusedClient.requestLocationUpdates(req, locationCallback as LocationCallback, mainLooper)
+    }
+
+    private fun stopLocationUpdates() {
+        locationCallback?.let { fusedClient.removeLocationUpdates(it) }
     }
 }
 
@@ -652,6 +783,8 @@ fun HealthyStepsCounterApp(viewModel: StepCounterViewModel) {
 
 @Composable
 fun HomeScreen(viewModel: StepCounterViewModel, padding: PaddingValues, onViewAll: () -> Unit) {
+    val fused = LocalFusedMetrics.current
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -664,9 +797,64 @@ fun HomeScreen(viewModel: StepCounterViewModel, padding: PaddingValues, onViewAl
         item { Spacer(Modifier.height(16.dp)) }
         item { StatusIndicator(viewModel) }
         item { Spacer(Modifier.height(16.dp)) }
+
+        // ---- NEW: Fusion card (GPS + accelerometer/steps) ----
+        item { FusionCard(fused) }
+
+        item { Spacer(Modifier.height(16.dp)) }
         item { MainCard(viewModel) }
         item { Spacer(Modifier.height(32.dp)) }
         item { HistorySection(viewModel, onViewAll = onViewAll) }
+    }
+}
+
+@Composable
+private fun FusionCard(fused: FusedMetrics) {
+    Card(
+        shape = RoundedCornerShape(20.dp),
+        elevation = CardDefaults.cardElevation(6.dp),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(16.dp)) {
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text("Sensor Fusion", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                val acc = fused.gpsAccuracyM
+                Text(
+                    if (acc.isNaN()) "GPS acc: —" else "GPS acc: %.1f m".format(acc),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.Gray
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+
+            StatRow(label = "Speed (GPS)", value = "%.2f km/h".format(fused.gpsSpeedMps * 3.6))
+            StatRow(label = "Speed (Steps)", value = "%.2f km/h".format(fused.stepSpeedMps * 3.6))
+            StatRow(label = "Speed (Fused)", value = "%.2f km/h".format(fused.fusedSpeedMps * 3.6))
+            Spacer(Modifier.height(8.dp))
+            Divider()
+            Spacer(Modifier.height(8.dp))
+            StatRow(label = "Distance (GPS)", value = "%.3f km".format(fused.gpsDistanceKm))
+            StatRow(label = "Distance (Steps)", value = "%.3f km".format(fused.stepDistanceKm))
+            StatRow(label = "Distance (Fused)", value = "%.3f km".format(fused.fusedDistanceKm))
+        }
+    }
+}
+
+@Composable
+private fun StatRow(label: String, value: String) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .padding(vertical = 4.dp),
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Text(label, style = MaterialTheme.typography.bodyLarge, color = Color.Gray)
+        Text(value, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
     }
 }
 
