@@ -1,3 +1,15 @@
+// <<< NEW >>> Add this whole block at the very top of the file.
+import java.util.Properties
+
+// Create a properties object
+val localProperties = Properties()
+// Create a reference to the local.properties file in the project's root
+val localPropertiesFile = rootProject.file("local.properties")
+// If the file exists, load its data into the properties object
+if (localPropertiesFile.exists()) {
+    localProperties.load(localPropertiesFile.inputStream())
+}
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -15,6 +27,9 @@ android {
         versionCode = 1
         versionName = "1.0"
         vectorDrawables { useSupportLibrary = true }
+
+        // <<< NEW >>> Add this line to link the key from local.properties
+        manifestPlaceholders["MAPS_API_KEY"] = localProperties.getProperty("MAPS_API_KEY", "NO_KEY_FOUND")
     }
 
     buildTypes {
@@ -44,7 +59,7 @@ android {
 }
 
 dependencies {
-
+    implementation("com.google.maps.android:maps-compose:4.3.3")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
     // Compose BOM
     implementation(platform("androidx.compose:compose-bom:2024.06.00"))

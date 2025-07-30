@@ -16,4 +16,7 @@ object PrefKeys {
     val COUNTER_BASE_DATE = stringPreferencesKey("counter_base_date")
     val DAILY_GOAL = intPreferencesKey("daily_goal")
     val THEME = stringPreferencesKey("theme_option")
+
+    // <<< NEW KEY FOR STORING ROUTES >>>
+    val ROUTE_HISTORY = stringPreferencesKey("route_history")
 }

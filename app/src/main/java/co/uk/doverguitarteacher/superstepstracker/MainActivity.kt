@@ -17,6 +17,7 @@ import androidx.activity.viewModels
 import androidx.annotation.Keep
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -37,31 +38,41 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.datastore.preferences.core.edit
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.android.gms.location.*
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.android.gms.maps.model.LatLng
+import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.Polyline
+import com.google.maps.android.compose.rememberCameraPositionState
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
-import java.util.Calendar
-import java.util.Date
-import java.util.Locale
+import java.util.*
 import kotlin.math.max
 import kotlin.math.sqrt
 
 // ------------------------- Models -------------------------
+// <<< NEW DATA CLASS FOR COORDINATES >>>
+@Keep
+data class LatLngData(val latitude: Double, val longitude: Double)
+
 @Keep
 data class DayStats(
     val dateKey: String,
     val label: String,
     val steps: Int,
     val distanceKm: Double,
-    val caloriesKcal: Double
+    val caloriesKcal: Double,
+    // <<< MODIFIED: ADDED ROUTE TO STATS >>>
+    val route: List<LatLngData> = emptyList()
 )
 
 // ------------------------- Utils (that need to remain private to MainActivity) -------------------------
@@ -98,6 +109,10 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
     var weeklyHistory by mutableStateOf<List<DayStats>>(emptyList())
         private set
 
+    // <<< NEW STATE FOR TODAY'S ROUTE >>>
+    var currentRoute by mutableStateOf<List<LatLngData>>(emptyList())
+        private set
+
     private val ds = app.dataStore
     private var cachedTodayKey: String = todayKey()
 
@@ -105,6 +120,27 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
     private var counterBaseDate: String? = null
 
     private var saveJob: Job? = null
+
+    // <<< NEW HELPERS to serialize/deserialize route data to a String >>>
+    private fun serializeRouteHistory(history: Map<String, List<LatLngData>>): String {
+        return history.entries.joinToString(";") { (key, points) ->
+            val routeStr = points.joinToString("|") { "${it.latitude},${it.longitude}" }
+            "$key:$routeStr"
+        }
+    }
+
+    private fun deserializeRouteHistory(data: String?): MutableMap<String, List<LatLngData>> {
+        if (data.isNullOrEmpty()) return mutableMapOf()
+        return data.split(';').filter { it.contains(':') }.associateTo(mutableMapOf()) { entry ->
+            val parts = entry.split(':', limit = 2)
+            val key = parts[0]
+            val points = parts.getOrNull(1)?.split('|')?.mapNotNull {
+                val coords = it.split(',')
+                if (coords.size == 2) try { LatLngData(coords[0].toDouble(), coords[1].toDouble()) } catch (e: Exception) { null } else null
+            } ?: emptyList()
+            key to points
+        }
+    }
 
     init {
         viewModelScope.launch {
@@ -125,6 +161,8 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         val storedDate = prefs[PrefKeys.TODAY_DATE]
         val storedSteps = prefs[PrefKeys.TODAY_STEPS] ?: 0
         val hist = decodeHistory(prefs[PrefKeys.HISTORY])
+        // <<< MODIFIED: Load route history >>>
+        val routeHist = deserializeRouteHistory(prefs[PrefKeys.ROUTE_HISTORY])
 
         counterBase = prefs[PrefKeys.COUNTER_BASE]
         counterBaseDate = prefs[PrefKeys.COUNTER_BASE_DATE]
@@ -134,26 +172,23 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         if (storedDate == null) {
             steps = 0
             cachedTodayKey = today
-            weeklyHistory = computeSevenDayList(hist, today, 0)
-            persist(today, 0, hist, null, null)
+            currentRoute = emptyList()
+            weeklyHistory = computeSevenDayList(hist, today, 0, routeHist)
+            persist(today, 0, hist, null, null, routeHist, currentRoute)
             return
         }
 
         if (storedDate != today) {
-            hist[storedDate] = DayStats(
-                dateKey = storedDate,
-                label = dayLabelFromKey(storedDate),
-                steps = max(hist[storedDate]?.steps ?: 0, storedSteps),
-                distanceKm = distanceFromSteps(max(hist[storedDate]?.steps ?: 0, storedSteps)),
-                caloriesKcal = caloriesFromSteps(max(hist[storedDate]?.steps ?: 0, storedSteps))
-            )
+            hist[storedDate] = DayStats(storedDate, dayLabelFromKey(storedDate), storedSteps, distanceFromSteps(storedSteps), caloriesFromSteps(storedSteps))
             val trimmed = trimToLast6(hist, today)
+            val trimmedRouteHist = routeHist.filterKeys { it in trimmed.keys || it == storedDate }.toMutableMap()
             steps = 0
             cachedTodayKey = today
-            weeklyHistory = computeSevenDayList(trimmed, today, 0)
+            currentRoute = emptyList() // New day, new route
+            weeklyHistory = computeSevenDayList(trimmed, today, 0, trimmedRouteHist)
             counterBase = null
             counterBaseDate = null
-            persist(today, 0, trimmed, null, null)
+            persist(today, 0, trimmed, null, null, trimmedRouteHist, currentRoute)
         } else {
             if (counterBaseDate != today) {
                 counterBase = null
@@ -161,34 +196,26 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
             }
             steps = storedSteps
             cachedTodayKey = today
+            currentRoute = routeHist[today] ?: emptyList() // <<< MODIFIED: Restore today's route >>>
             val trimmed = trimToLast6(hist, today)
-            weeklyHistory = computeSevenDayList(trimmed, today, storedSteps)
+            weeklyHistory = computeSevenDayList(trimmed, today, storedSteps, routeHist)
         }
     }
 
     private fun computeSevenDayList(
         hist: Map<String, DayStats>,
         todayKey: String,
-        todaySteps: Int
+        todaySteps: Int,
+        // <<< MODIFIED: Pass routes in >>>
+        routeHist: Map<String, List<LatLngData>>
     ): List<DayStats> {
         val keys = last7Keys()
         return keys.map { k ->
             if (k == todayKey) {
-                DayStats(
-                    dateKey = k,
-                    label = "Today",
-                    steps = max(0, todaySteps),
-                    distanceKm = distanceFromSteps(todaySteps),
-                    caloriesKcal = caloriesFromSteps(todaySteps)
-                )
+                DayStats(k, "Today", max(0, todaySteps), distanceFromSteps(todaySteps), caloriesFromSteps(todaySteps), route = currentRoute)
             } else {
-                hist[k] ?: DayStats(
-                    dateKey = k,
-                    label = dayLabelFromKey(k),
-                    steps = 0,
-                    distanceKm = 0.0,
-                    caloriesKcal = 0.0
-                )
+                val existing = hist[k]
+                existing?.copy(route = routeHist[k] ?: emptyList()) ?: DayStats(k, dayLabelFromKey(k), 0, 0.0, 0.0, route = routeHist[k] ?: emptyList())
             }
         }
     }
@@ -198,17 +225,25 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         return hist.filterKeys { it in keep }.toMutableMap()
     }
 
+    // <<< MODIFIED: persist function signature and body to handle routes >>>
     private suspend fun persist(
         today: String,
         todaySteps: Int,
         hist: Map<String, DayStats>,
         base: Float?,
-        baseDate: String?
+        baseDate: String?,
+        routeHist: Map<String, List<LatLngData>>,
+        currentRoute: List<LatLngData>
     ) {
         ds.edit { e ->
             e[PrefKeys.TODAY_DATE] = today
             e[PrefKeys.TODAY_STEPS] = todaySteps
             e[PrefKeys.HISTORY] = encodeHistory(hist)
+
+            val combinedRoutes = routeHist.toMutableMap()
+            combinedRoutes[today] = currentRoute
+            e[PrefKeys.ROUTE_HISTORY] = serializeRouteHistory(combinedRoutes)
+
             if (base != null && baseDate != null) {
                 e[PrefKeys.COUNTER_BASE] = base
                 e[PrefKeys.COUNTER_BASE_DATE] = baseDate
@@ -219,28 +254,31 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // <<< MODIFIED: ensureDateRollover to save the completed route >>>
     private suspend fun ensureDateRollover() {
         val current = todayKey()
         if (current != cachedTodayKey) {
             val prefs = ds.data.first()
             val hist = decodeHistory(prefs[PrefKeys.HISTORY])
-            hist[cachedTodayKey] = DayStats(
-                dateKey = cachedTodayKey,
-                label = dayLabelFromKey(cachedTodayKey),
-                steps = steps,
-                distanceKm = distanceFromSteps(steps),
-                caloriesKcal = caloriesFromSteps(steps)
-            )
+            val routeHist = deserializeRouteHistory(prefs[PrefKeys.ROUTE_HISTORY])
+
+            hist[cachedTodayKey] = DayStats(cachedTodayKey, dayLabelFromKey(cachedTodayKey), steps, distanceFromSteps(steps), caloriesFromSteps(steps))
+            routeHist[cachedTodayKey] = currentRoute
+
             val trimmed = trimToLast6(hist, current)
+            val trimmedRouteHist = routeHist.filterKeys { it in trimmed.keys || it == cachedTodayKey }.toMutableMap()
+
             cachedTodayKey = current
             steps = 0
-            weeklyHistory = computeSevenDayList(trimmed, current, 0)
+            currentRoute = emptyList() // Clear route for new day
+            weeklyHistory = computeSevenDayList(trimmed, current, 0, trimmedRouteHist)
             counterBase = null
             counterBaseDate = null
-            persist(current, 0, trimmed, null, null)
+            persist(current, 0, trimmed, null, null, trimmedRouteHist, currentRoute)
         }
     }
 
+    // <<< MODIFIED: onHardwareCounter to update persist calls with route data >>>
     fun onHardwareCounter(totalSinceBoot: Float) {
         viewModelScope.launch {
             val currentKey = todayKey()
@@ -252,27 +290,37 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
                 updateSteps(newSteps)
                 val prefs = ds.data.first()
                 val hist = decodeHistory(prefs[PrefKeys.HISTORY])
-                persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
+                val routeHist = deserializeRouteHistory(prefs[PrefKeys.ROUTE_HISTORY])
+                persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate, routeHist, currentRoute)
             } else {
                 if (counterBase == null || counterBaseDate != cachedTodayKey) {
                     counterBase = totalSinceBoot - steps.toFloat()
                     counterBaseDate = cachedTodayKey
-                    val prefs = ds.data.first()
-                    val hist = decodeHistory(prefs[PrefKeys.HISTORY])
-                    persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
                 }
                 val calc = (totalSinceBoot - (counterBase ?: 0f)).toInt()
                 if (calc < steps) {
                     counterBase = totalSinceBoot - steps.toFloat()
                     counterBaseDate = cachedTodayKey
-                    val prefs = ds.data.first()
-                    val hist = decodeHistory(prefs[PrefKeys.HISTORY])
-                    persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
                 } else {
                     updateSteps(calc)
                 }
+                // Save is now handled by updateSteps -> scheduleSave
             }
         }
+    }
+
+    // <<< NEW FUNCTION to add a location point to the current route >>>
+    fun addPointToCurrentRoute(location: Location) {
+        if (location.accuracy > 25) return // Ignore low-accuracy points
+        val newPoint = LatLngData(location.latitude, location.longitude)
+        if (currentRoute.isNotEmpty()) {
+            val lastPoint = currentRoute.last()
+            val results = FloatArray(1)
+            Location.distanceBetween(lastPoint.latitude, lastPoint.longitude, newPoint.latitude, newPoint.longitude, results)
+            if (results[0] < 5) return // Ignore if moved less than 5 meters
+        }
+        currentRoute = currentRoute + newPoint
+        updateWeeklyToday()
     }
 
     fun updateSteps(count: Int) {
@@ -299,27 +347,26 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         checkWalkingStatus()
     }
 
+    // <<< MODIFIED: updateWeeklyToday to also update the route in the UI list >>>
     private fun updateWeeklyToday() {
         val current = cachedTodayKey
         weeklyHistory = weeklyHistory.map { d ->
             if (d.dateKey == current) {
                 val s = steps
-                d.copy(
-                    steps = s,
-                    distanceKm = distanceFromSteps(s),
-                    caloriesKcal = caloriesFromSteps(s)
-                )
+                d.copy(steps = s, distanceKm = distanceFromSteps(s), caloriesKcal = caloriesFromSteps(s), route = currentRoute)
             } else d
         }
     }
 
+    // <<< MODIFIED: scheduleSave to pass all required data to persist >>>
     private fun scheduleSave() {
         saveJob?.cancel()
         saveJob = viewModelScope.launch {
             delay(1_000)
             val prefs = ds.data.first()
             val hist = decodeHistory(prefs[PrefKeys.HISTORY])
-            persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
+            val routeHist = deserializeRouteHistory(prefs[PrefKeys.ROUTE_HISTORY])
+            persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate, routeHist, currentRoute)
         }
     }
 
@@ -590,6 +637,9 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             locationCallback = object : LocationCallback() {
                 override fun onLocationResult(result: LocationResult) {
                     val loc = result.lastLocation ?: return
+                    // <<< ADDED: Send location update to ViewModel >>>
+                    stepCounterViewModel.addPointToCurrentRoute(loc)
+
                     val now = System.currentTimeMillis()
                     val acc = loc.accuracy
                     val ageMs = 0L
@@ -705,9 +755,7 @@ private fun HomeScreen(
         Spacer(Modifier.height(16.dp))
         StatusIndicator(viewModel)
         Spacer(Modifier.height(16.dp))
-
         FusionCard(fused)
-
         Spacer(Modifier.height(16.dp))
         MainCard(viewModel, dailyGoal, displayMode, onDisplayModeChange)
         Spacer(Modifier.height(32.dp))
@@ -763,6 +811,8 @@ private fun StatRow(label: String, value: String) {
         Text(value, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
     }
 }
+
+// <<< MODIFIED: StatsScreen to manage and show the map dialog >>>
 @Composable
 private fun StatsScreen(
     viewModel: StepCounterViewModel,
@@ -771,6 +821,14 @@ private fun StatsScreen(
     displayMode: DisplayMode,
     onDisplayModeChange: (DisplayMode) -> Unit
 ) {
+    // State to manage which day's map to show. Null means no dialog.
+    var showMapForDay by remember { mutableStateOf<DayStats?>(null) }
+
+    // When showMapForDay is not null, the dialog will appear
+    showMapForDay?.let { day ->
+        RouteMapDialog(dayStats = day, onDismiss = { showMapForDay = null })
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -860,15 +918,21 @@ private fun StatsScreen(
                 Text("Weekly Progress", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 Spacer(Modifier.height(8.dp))
                 viewModel.weeklyHistory.forEach { d ->
-                    WeeklyProgressBar(
-                        day = d.label,
-                        steps = d.steps,
-                        goal = dailyGoal,
-                        isToday = d.label == "Today",
-                        distanceKm = d.distanceKm,
-                        calories = d.caloriesKcal,
-                        displayMode = displayMode
-                    )
+                    // <<< MODIFIED: Wrap progress bar in a clickable Box to show map >>>
+                    Box(modifier = Modifier.clickable(enabled = d.route.isNotEmpty()) {
+                        showMapForDay = d
+                    }) {
+                        WeeklyProgressBar(
+                            day = d.label,
+                            steps = d.steps,
+                            goal = dailyGoal,
+                            isToday = d.label == "Today",
+                            distanceKm = d.distanceKm,
+                            calories = d.caloriesKcal,
+                            displayMode = displayMode,
+                            hasRoute = d.route.isNotEmpty()
+                        )
+                    }
                 }
             }
         }
@@ -1107,6 +1171,7 @@ private fun StatItem(label: String, value: String) {
         }
     }
 }
+// <<< MODIFIED: HistorySection now passes route info to its progress bars >>>
 @Composable
 private fun HistorySection(
     viewModel: StepCounterViewModel,
@@ -1140,12 +1205,15 @@ private fun HistorySection(
                     isToday = day.label == "Today",
                     distanceKm = day.distanceKm,
                     calories = day.caloriesKcal,
-                    displayMode = displayMode
+                    displayMode = displayMode,
+                    hasRoute = day.route.isNotEmpty() // Pass route info
                 )
             }
         }
     }
 }
+
+// <<< MODIFIED: WeeklyProgressBar now accepts `hasRoute` and shows a map icon >>>
 @Composable
 private fun WeeklyProgressBar(
     day: String,
@@ -1154,7 +1222,8 @@ private fun WeeklyProgressBar(
     isToday: Boolean = false,
     distanceKm: Double,
     calories: Double,
-    displayMode: DisplayMode
+    displayMode: DisplayMode,
+    hasRoute: Boolean
 ) {
     val prog = (steps / goal.toFloat()).coerceIn(0f, 1f)
     Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1176,11 +1245,23 @@ private fun WeeklyProgressBar(
                 )
             }
             Spacer(Modifier.height(2.dp))
-            Text(
-                "%.2f km • %.0f kcal".format(distanceKm, calories),
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.Gray
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "%.2f km • %.0f kcal".format(distanceKm, calories),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray
+                )
+                if (hasRoute) {
+                    Icon(
+                        Icons.Default.Map,
+                        contentDescription = "Map available",
+                        tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                        modifier = Modifier
+                            .size(14.dp)
+                            .padding(start = 4.dp)
+                    )
+                }
+            }
         }
         Column(horizontalAlignment = Alignment.End, modifier = Modifier.width(90.dp)) {
             Text(
@@ -1230,5 +1311,49 @@ private fun PlaceholderScreen(title: String, padding: PaddingValues) {
         Icon(Icons.Default.Build, contentDescription = null, tint = Color.Gray)
         Spacer(Modifier.height(8.dp))
         Text("$title coming soon", color = Color.Gray)
+    }
+}
+
+// <<< NEW COMPOSABLE for displaying the map in a dialog >>>
+@Composable
+private fun RouteMapDialog(dayStats: DayStats, onDismiss: () -> Unit) {
+    if (dayStats.route.isEmpty()) {
+        return // Safeguard, should not be called if route is empty.
+    }
+
+    val routeLatLngs = remember(dayStats.route) {
+        dayStats.route.map { LatLng(it.latitude, it.longitude) }
+    }
+
+    val cameraPositionState = rememberCameraPositionState {
+        position = CameraPosition.fromLatLngZoom(routeLatLngs.first(), 15f)
+    }
+
+    Dialog(onDismissRequest = onDismiss) {
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(450.dp),
+            shape = RoundedCornerShape(20.dp),
+        ) {
+            Column {
+                Text(
+                    "Route for ${dayStats.label}",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(16.dp)
+                )
+                GoogleMap(
+                    modifier = Modifier.fillMaxSize(),
+                    cameraPositionState = cameraPositionState
+                ) {
+                    Polyline(
+                        points = routeLatLngs,
+                        color = MaterialTheme.colorScheme.primary,
+                        width = 15f
+                    )
+                }
+            }
+        }
     }
 }
