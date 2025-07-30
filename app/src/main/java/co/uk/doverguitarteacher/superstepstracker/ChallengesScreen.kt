@@ -9,32 +9,18 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.Immutable
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 
-@Immutable
-private data class Challenge(
-    val title: String,
-    val description: String,
-    val icon: ImageVector,
-    val progress: Float
-)
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun ChallengesScreen(padding: PaddingValues) {
-    val challenges = remember {
-        listOf(
-            Challenge("Weekend Warrior", "Get 25,000 steps over a weekend.", Icons.Default.Star, 0.75f),
-            Challenge("Daily Streak", "Hit your daily goal 7 days in a row.", Icons.Default.Whatshot, 0.4f),
-            Challenge("Mountain Climber", "A tough challenge for the most dedicated.", Icons.Default.Terrain, 0.1f)
-        )
-    }
+fun ChallengesScreen(padding: PaddingValues, viewModel: ChallengesViewModel) {
+    val challenges by viewModel.challenges.collectAsState()
+
     Scaffold(
         modifier = Modifier.padding(padding),
         topBar = {
@@ -87,6 +73,12 @@ private fun ChallengeCard(challenge: Challenge) {
                 LinearProgressIndicator(
                     progress = { challenge.progress },
                     modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = "${challenge.current} / ${challenge.goal}",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.align(Alignment.End)
                 )
             }
         }
