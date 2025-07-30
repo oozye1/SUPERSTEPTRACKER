@@ -12,12 +12,13 @@ import kotlinx.coroutines.launch
 class SettingsViewModel(app: Application) : AndroidViewModel(app) {
     private val ds = app.dataStore
 
-    val dailyGoal = ds.data.map { it[PrefKeys.DAILY_GOAL] ?: 10000 }
-        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 10000)
+    val dailyGoal = ds.data.map { preferences ->
+        preferences[PrefKeys.DAILY_GOAL] ?: 10000
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), 10000)
 
-    val themeOption = ds.data.map {
+    val themeOption = ds.data.map { preferences ->
         try {
-            ThemeOption.valueOf(it[PrefKeys.THEME] ?: ThemeOption.System.name)
+            ThemeOption.valueOf(preferences[PrefKeys.THEME] ?: ThemeOption.System.name)
         } catch (e: IllegalArgumentException) {
             ThemeOption.System
         }
@@ -25,13 +26,17 @@ class SettingsViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setDailyGoal(goal: Int) {
         viewModelScope.launch {
-            ds.edit { it[PrefKeys.DAILY_GOAL] = goal }
+            ds.edit { settings ->
+                settings[PrefKeys.DAILY_GOAL] = goal
+            }
         }
     }
 
     fun setThemeOption(option: ThemeOption) {
         viewModelScope.launch {
-            ds.edit { it[PrefKeys.THEME] = option.name }
+            ds.edit { settings ->
+                settings[PrefKeys.THEME] = option.name
+            }
         }
     }
 }
