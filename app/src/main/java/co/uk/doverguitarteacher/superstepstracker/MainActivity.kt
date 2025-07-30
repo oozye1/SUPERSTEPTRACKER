@@ -17,8 +17,8 @@ import androidx.activity.viewModels
 import androidx.annotation.Keep
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -58,33 +58,26 @@ import java.util.Locale
 import kotlin.math.max
 import kotlin.math.sqrt
 
-// ------------------------- DataStore -------------------------
-private val Context.dataStore by preferencesDataStore(name = "steps_prefs")
-private object PrefKeys {
-    val TODAY_DATE = stringPreferencesKey("today_date")          // yyyy-MM-dd
-    val TODAY_STEPS = intPreferencesKey("today_steps")           // Int
-    // History string; supports both formats:
-    //   v1: "yyyy-MM-dd:steps|..."
-    //   v2: "yyyy-MM-dd:steps:distanceKm:calories|..."
+// DataStore is now in AppDataStore.kt
+private object OldPrefKeys {
+    val TODAY_DATE = stringPreferencesKey("today_date")
+    val TODAY_STEPS = intPreferencesKey("today_steps")
     val HISTORY = stringPreferencesKey("history")
-    // Baseline for hardware counter
     val COUNTER_BASE = floatPreferencesKey("counter_base")
-    val COUNTER_BASE_DATE = stringPreferencesKey("counter_base_date") // yyyy-MM-dd
-    // Primary metric ("steps" or "distance")
-    val PRIMARY_METRIC = stringPreferencesKey("primary_metric")
+    val COUNTER_BASE_DATE = stringPreferencesKey("counter_base_date")
 }
 
-// ------------------------- Models -------------------------
+// Models and Utils are unchanged
+@Immutable
 @Keep
 data class DayStats(
-    val dateKey: String,          // yyyy-MM-dd
-    val label: String,            // "Mon"..."Sun" or "Today"
+    val dateKey: String,
+    val label: String,
     val steps: Int,
     val distanceKm: Double,
     val caloriesKcal: Double
 )
 
-// ------------------------- Utils -------------------------
 private fun todayKey(): String {
     val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
     return sdf.format(Date())
@@ -110,15 +103,12 @@ private fun formatDisplayDate(date: Date = Date()): String {
 private fun distanceFromSteps(steps: Int): Double = steps * 0.762 / 1000.0
 private fun caloriesFromSteps(steps: Int): Double = steps * 0.04
 
-// Decode "HISTORY" to a mutable map of DayStats keyed by dateKey.
 private fun decodeHistory(raw: String?): MutableMap<String, DayStats> {
     val out = mutableMapOf<String, DayStats>()
     if (raw.isNullOrBlank()) return out
     val parts = raw.split("|").filter { it.isNotBlank() }
     parts.forEach { token ->
         val cols = token.split(":")
-        // v1: date:steps
-        // v2: date:steps:distance:calories
         if (cols.size >= 2) {
             val date = cols[0].trim()
             val steps = cols[1].trim().toIntOrNull() ?: 0
@@ -138,7 +128,6 @@ private fun decodeHistory(raw: String?): MutableMap<String, DayStats> {
     return out
 }
 
-// Encode history map as v2 format (with distance & calories) using '.' decimals consistently.
 private fun encodeHistory(map: Map<String, DayStats>): String {
     return map.entries
         .sortedBy { it.key }
@@ -150,7 +139,6 @@ private fun encodeHistory(map: Map<String, DayStats>): String {
         }
 }
 
-// Generate the last 6 days + today as date keys (oldest -> today)
 private fun last7Keys(): List<String> {
     val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
     val cal = Calendar.getInstance().apply {
@@ -169,10 +157,9 @@ private fun last7Keys(): List<String> {
     return keys.toList()
 }
 
-// ------------------------- ViewModel -------------------------
+// ViewModel is unchanged
 class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
 
-    // Live UI state
     var steps by mutableStateOf(0)
         private set
     var lastStepTime by mutableStateOf(0L)
@@ -183,19 +170,13 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var walkingIntensity by mutableStateOf("Inactive")
         private set
-    var primaryMetric by mutableStateOf("steps") // "steps" or "distance"
-        private set
 
     var weeklyHistory by mutableStateOf<List<DayStats>>(emptyList())
         private set
 
-    val dailyGoal = 10_000
-
-    // Persistence
-    private val ds get() = getApplication<Application>().dataStore
+    private val ds by lazy { getApplication<Application>().getSharedPreferences("steps_prefs", Context.MODE_PRIVATE) }
     private var cachedTodayKey: String = todayKey()
 
-    // Hardware counter baseline (cumulative since boot)
     private var counterBase: Float? = null
     private var counterBaseDate: String? = null
 
@@ -204,7 +185,6 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
     init {
         viewModelScope.launch {
             bootstrapFromStorage()
-            // keep an eye on midnight rollover
             launch {
                 while (true) {
                     delay(30_000)
@@ -216,49 +196,13 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // Toggle primary metric between steps and distance
-    fun togglePrimaryMetric() {
-        primaryMetric = if (primaryMetric == "steps") "distance" else "steps"
-        viewModelScope.launch {
-            ds.edit { e ->
-                e[PrefKeys.PRIMARY_METRIC] = primaryMetric
-            }
-        }
-    }
-
-    // Get primary value based on current metric
-    fun getPrimaryValue(steps: Int): String {
-        return if (primaryMetric == "steps") {
-            "%,d".format(steps)
-        } else {
-            "%.2f".format(distanceFromSteps(steps))
-        }
-    }
-
-    // Get primary unit label
-    fun getPrimaryLabel(): String {
-        return if (primaryMetric == "steps") "Steps" else "km"
-    }
-
-    // Get goal in primary metric
-    fun getPrimaryGoal(): String {
-        return if (primaryMetric == "steps") {
-            "%,d steps".format(dailyGoal)
-        } else {
-            "%.2f km".format(distanceFromSteps(dailyGoal))
-        }
-    }
-
-    // ---------- Persistence bootstrap ----------
     private suspend fun bootstrapFromStorage() {
-        val prefs = ds.data.first()
-        val storedDate = prefs[PrefKeys.TODAY_DATE]
-        val storedSteps = prefs[PrefKeys.TODAY_STEPS] ?: 0
-        val hist = decodeHistory(prefs[PrefKeys.HISTORY])
+        val storedDate = ds.getString("today_date", null)
+        val storedSteps = ds.getInt("today_steps", 0)
+        val hist = decodeHistory(ds.getString("history", null))
 
-        counterBase = prefs[PrefKeys.COUNTER_BASE]
-        counterBaseDate = prefs[PrefKeys.COUNTER_BASE_DATE]
-        primaryMetric = prefs[PrefKeys.PRIMARY_METRIC] ?: "steps"
+        counterBase = if (ds.contains("counter_base")) ds.getFloat("counter_base", 0f) else null
+        counterBaseDate = ds.getString("counter_base_date", null)
 
         val today = todayKey()
 
@@ -271,7 +215,6 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         if (storedDate != today) {
-            // Move yesterday into history with distance & calories
             hist[storedDate] = DayStats(
                 dateKey = storedDate,
                 label = dayLabelFromKey(storedDate),
@@ -283,12 +226,10 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
             steps = 0
             cachedTodayKey = today
             weeklyHistory = computeSevenDayList(trimmed, today, 0)
-            // reset baseline for new day; will be set on first hardware event
             counterBase = null
             counterBaseDate = null
             persist(today, 0, trimmed, null, null)
         } else {
-            // same day
             if (counterBaseDate != today) {
                 counterBase = null
                 counterBaseDate = null
@@ -339,27 +280,25 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         base: Float?,
         baseDate: String?
     ) {
-        getApplication<Application>().dataStore.edit { e ->
-            e[PrefKeys.TODAY_DATE] = today
-            e[PrefKeys.TODAY_STEPS] = todaySteps
-            e[PrefKeys.HISTORY] = encodeHistory(hist)
-            e[PrefKeys.PRIMARY_METRIC] = primaryMetric
+        with(ds.edit()) {
+            putString("today_date", today)
+            putInt("today_steps", todaySteps)
+            putString("history", encodeHistory(hist))
             if (base != null && baseDate != null) {
-                e[PrefKeys.COUNTER_BASE] = base
-                e[PrefKeys.COUNTER_BASE_DATE] = baseDate
+                putFloat("counter_base", base)
+                putString("counter_base_date", baseDate)
             } else {
-                e.remove(PrefKeys.COUNTER_BASE)
-                e.remove(PrefKeys.COUNTER_BASE_DATE)
+                remove("counter_base")
+                remove("counter_base_date")
             }
+            apply()
         }
     }
 
     private suspend fun ensureDateRollover() {
         val current = todayKey()
         if (current != cachedTodayKey) {
-            val prefs = ds.data.first()
-            val hist = decodeHistory(prefs[PrefKeys.HISTORY])
-            // push previous day's final stats
+            val hist = decodeHistory(ds.getString("history", null))
             hist[cachedTodayKey] = DayStats(
                 dateKey = cachedTodayKey,
                 label = dayLabelFromKey(cachedTodayKey),
@@ -377,7 +316,6 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------- Hardware counter handling ----------
     fun onHardwareCounter(totalSinceBoot: Float) {
         viewModelScope.launch {
             val currentKey = todayKey()
@@ -387,23 +325,20 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
                 counterBase = totalSinceBoot - newSteps.toFloat()
                 counterBaseDate = currentKey
                 updateSteps(newSteps)
-                val prefs = ds.data.first()
-                val hist = decodeHistory(prefs[PrefKeys.HISTORY])
+                val hist = decodeHistory(ds.getString("history", null))
                 persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
             } else {
                 if (counterBase == null || counterBaseDate != cachedTodayKey) {
                     counterBase = totalSinceBoot - steps.toFloat()
                     counterBaseDate = cachedTodayKey
-                    val prefs = ds.data.first()
-                    val hist = decodeHistory(prefs[PrefKeys.HISTORY])
+                    val hist = decodeHistory(ds.getString("history", null))
                     persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
                 }
                 val calc = (totalSinceBoot - (counterBase ?: 0f)).toInt()
                 if (calc < steps) {
                     counterBase = totalSinceBoot - steps.toFloat()
                     counterBaseDate = cachedTodayKey
-                    val prefs = ds.data.first()
-                    val hist = decodeHistory(prefs[PrefKeys.HISTORY])
+                    val hist = decodeHistory(ds.getString("history", null))
                     persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
                 } else {
                     updateSteps(calc)
@@ -412,7 +347,6 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------- State updates ----------
     fun updateSteps(count: Int) {
         steps = max(0, count)
         checkWalkingStatus()
@@ -454,9 +388,8 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
     private fun scheduleSave() {
         saveJob?.cancel()
         saveJob = viewModelScope.launch {
-            delay(1_000) // debounce
-            val prefs = ds.data.first()
-            val hist = decodeHistory(prefs[PrefKeys.HISTORY])
+            delay(1_000)
+            val hist = decodeHistory(ds.getString("history", null))
             persist(cachedTodayKey, steps, hist, counterBase, counterBaseDate)
         }
     }
@@ -488,26 +421,15 @@ class StepCounterViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ---------- Stats aggregates ----------
-    val weeklyTotal: Int
-        get() = weeklyHistory.sumOf { it.steps }
-
-    val weeklyAverage: Int
-        get() = if (weeklyHistory.isEmpty()) 0 else weeklyTotal / weeklyHistory.size
-
-    val weeklyDistance: Double
-        get() = weeklyHistory.sumOf { it.distanceKm }
-
-    val weeklyCalories: Double
-        get() = weeklyHistory.sumOf { it.caloriesKcal }
-
-    val bestDay: DayStats?
-        get() = weeklyHistory.maxByOrNull { it.steps }
+    val weeklyTotal: Int by derivedStateOf { weeklyHistory.sumOf { it.steps } }
+    val weeklyAverage: Int by derivedStateOf { if (weeklyHistory.isEmpty()) 0 else weeklyTotal / weeklyHistory.size }
+    val weeklyDistance: Double by derivedStateOf { weeklyHistory.sumOf { it.distanceKm } }
+    val weeklyCalories: Double by derivedStateOf { weeklyHistory.sumOf { it.caloriesKcal } }
+    val bestDay: DayStats? by derivedStateOf { weeklyHistory.maxByOrNull { it.steps } }
 }
 
-// ------------------------- Activity & sensors + GPS fusion -------------------------
-
-// Fusion state provided to UI via CompositionLocal (no signature changes to your composables)
+// Activity and UI
+@Immutable
 data class FusedMetrics(
     val gpsAccuracyM: Float = Float.NaN,
     val lastFixAgeMs: Long = Long.MAX_VALUE,
@@ -526,7 +448,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var stepDetectorSensor: Sensor? = null
     private var accelerometerSensor: Sensor? = null
 
-    // Hardware step-counter liveness tracking (prevents the "stops at 10" issue)
     private var lastHardwareCounterEventTime = 0L
     private var lastHardwareCounterValue: Float? = null
     private var hardwareCounterCandidate = false
@@ -536,12 +457,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private val inManualMode: Boolean
         get() = !isHardwareActive
 
-    // Manual (fallback) detection state
     private var lastStepTime = 0L
     private var stepThreshold = 12.0f
     private var manualStepCount = 0
 
     private val stepCounterViewModel: StepCounterViewModel by viewModels()
+    private val settingsViewModel: SettingsViewModel by viewModels()
 
     companion object {
         private const val TAG = "StepCounter"
@@ -549,7 +470,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         private const val PERMISSION_REQUEST_LOCATION = 2
     }
 
-    // ---- GPS / FusedLocation ----
     private lateinit var fusedClient: FusedLocationProviderClient
     private var locationCallback: LocationCallback? = null
 
@@ -558,10 +478,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     private var gpsDistanceMeters = 0.0
     private var fusedDistanceMeters = 0.0
 
-    // Step-derived stride (fixed for this "non-invasive" option)
     private var strideMeters = 0.762
 
-    // Cadence window
     private val stepTimestamps = ArrayDeque<Long>()
     private fun pushStepTs(ts: Long) {
         stepTimestamps.addLast(ts)
@@ -583,27 +501,25 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
     private fun gpsWeight(acc: Float, ageMs: Long): Double {
         val base = when {
-            acc <= 5f  -> 0.85
+            acc <= 5f -> 0.85
             acc <= 10f -> 0.65
             acc <= 20f -> 0.40
-            else       -> 0.15
+            else -> 0.15
         }
         val agePenalty = when {
-            ageMs <= 2_000L  -> 1.0
-            ageMs <= 5_000L  -> 0.9
+            ageMs <= 2_000L -> 1.0
+            ageMs <= 5_000L -> 0.9
             ageMs <= 10_000L -> 0.8
-            else             -> 0.6
+            else -> 0.6
         }
         return (base * agePenalty).coerceIn(0.0, 0.95)
     }
 
-    // State for UI
     private val fusedState = mutableStateOf(FusedMetrics())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Permissions (activity recognition already requested below; add location too)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACTIVITY_RECOGNITION)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -638,9 +554,18 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         Log.d(TAG, "Accelerometer available: ${accelerometerSensor != null}")
 
         setContent {
-            CompositionLocalProvider(LocalFusedMetrics provides fusedState.value) {
-                MaterialTheme {
-                    HealthyStepsCounterApp(stepCounterViewModel)
+            val themeOption by settingsViewModel.themeOption.collectAsState()
+            val useDarkTheme = when (themeOption) {
+                ThemeOption.Light -> false
+                ThemeOption.Dark -> true
+                ThemeOption.System -> isSystemInDarkTheme()
+            }
+
+            MaterialTheme(
+                colorScheme = if (useDarkTheme) darkColorScheme() else lightColorScheme()
+            ) {
+                CompositionLocalProvider(LocalFusedMetrics provides fusedState.value) {
+                    HealthyStepsCounterApp(stepCounterViewModel, settingsViewModel)
                 }
             }
         }
@@ -659,7 +584,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             sensorManager.registerListener(this, sensor, SensorManager.SENSOR_DELAY_UI)
         }
 
-        // Reset hardware liveness and align fallback counter with persisted steps
         hardwareCounterCandidate = false
         lastHardwareCounterEventTime = 0L
         lastHardwareCounterValue = null
@@ -688,8 +612,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     if (lastVal == null || totalSinceBoot >= lastVal) {
                         stepCounterViewModel.onHardwareCounter(totalSinceBoot)
                     }
-                    // keep fused "step-speed" responsive using cadence window whenever detector not firing
-                    // (cadence window updated mainly by detector or fallback below)
                 }
                 Sensor.TYPE_STEP_DETECTOR -> {
                     if (inManualMode) {
@@ -726,7 +648,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         Log.d(TAG, "Sensor accuracy changed: ${sensor?.name} = $accuracy")
     }
 
-    // ---------- GPS ----------
     @Suppress("MissingPermission")
     private fun startLocationUpdates() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
@@ -739,11 +660,10 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     val loc = result.lastLocation ?: return
                     val now = System.currentTimeMillis()
                     val acc = loc.accuracy
-                    val ageMs = 0L // callback is fresh
+                    val ageMs = 0L
 
                     val gpsSpeed = if (loc.hasSpeed()) loc.speed.toDouble() else 0.0
 
-                    // GPS segment distance with simple gates to avoid jumps
                     lastGoodLocation?.let { prev ->
                         val seg = prev.distanceTo(loc).toDouble()
                         if (seg.isFinite() && seg >= 0.0 && acc <= 50f && seg <= 100.0) {
@@ -752,10 +672,8 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     }
                     lastGoodLocation = loc
 
-                    // Step-derived speed from cadence
                     val stepSpeed = stepSpeedMps(now)
 
-                    // Weighted fusion
                     val w = gpsWeight(acc, ageMs)
                     val fusedSpeed = w * gpsSpeed + (1 - w) * stepSpeed
 
@@ -764,7 +682,6 @@ class MainActivity : ComponentActivity(), SensorEventListener {
                     fusedDistanceMeters += fusedSpeed * dtSec
                     lastFixTimeMs = now
 
-                    // Step distance (fixed stride for this mode)
                     val stepDist = stepCounterViewModel.steps * strideMeters
 
                     fusedState.value = fusedState.value.copy(
@@ -800,8 +717,12 @@ class MainActivity : ComponentActivity(), SensorEventListener {
 
 // ------------------------- UI -------------------------
 @Composable
-fun HealthyStepsCounterApp(viewModel: StepCounterViewModel) {
+private fun HealthyStepsCounterApp(
+    stepViewModel: StepCounterViewModel,
+    settingsViewModel: SettingsViewModel
+) {
     var selected by rememberSaveable { mutableStateOf(0) }
+    val dailyGoal by settingsViewModel.dailyGoal.collectAsState()
 
     Scaffold(
         bottomBar = {
@@ -812,47 +733,51 @@ fun HealthyStepsCounterApp(viewModel: StepCounterViewModel) {
         }
     ) { padding ->
         when (selected) {
-            0 -> HomeScreen(viewModel, padding, onViewAll = { selected = 1 })
-            1 -> StatsScreen(viewModel, padding)
-            2 -> PlaceholderScreen("Challenges", padding)
+            0 -> HomeScreen(stepViewModel, dailyGoal, padding, onViewAll = { selected = 1 }, onSettings = { selected = 4})
+            1 -> StatsScreen(stepViewModel, dailyGoal, padding)
+            2 -> ChallengesScreen(padding)
             3 -> PlaceholderScreen("Profile", padding)
+            4 -> SettingsScreen(
+                padding = padding,
+                viewModel = settingsViewModel,
+                onNavigateUp = { selected = 0 }
+            )
         }
     }
 }
 
 @Composable
-fun HomeScreen(viewModel: StepCounterViewModel, padding: PaddingValues, onViewAll: () -> Unit) {
+private fun HomeScreen(viewModel: StepCounterViewModel, dailyGoal: Int, padding: PaddingValues, onViewAll: () -> Unit, onSettings: () -> Unit) {
     val fused = LocalFusedMetrics.current
 
-    LazyColumn(
+    Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(padding)
-            .background(Color(0xFFF0F4F8))
+            .verticalScroll(rememberScrollState())
+            .background(MaterialTheme.colorScheme.background)
             .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        item { Header() }
-        item { Spacer(Modifier.height(16.dp)) }
-        item { StatusIndicator(viewModel) }
-        item { Spacer(Modifier.height(16.dp)) }
+        Header(onSettings)
+        Spacer(Modifier.height(16.dp))
+        StatusIndicator(viewModel)
+        Spacer(Modifier.height(16.dp))
 
-        // ---- NEW: Fusion card (GPS + accelerometer/steps) ----
-        item { FusionCard(fused) }
+        FusionCard(fused)
 
-        item { Spacer(Modifier.height(16.dp)) }
-        item { MainCard(viewModel) }
-        item { Spacer(Modifier.height(32.dp)) }
-        item { HistorySection(viewModel, onViewAll = onViewAll) }
+        Spacer(Modifier.height(16.dp))
+        MainCard(viewModel, dailyGoal)
+        Spacer(Modifier.height(32.dp))
+        HistorySection(viewModel, dailyGoal, onViewAll = onViewAll)
     }
 }
-
 @Composable
 private fun FusionCard(fused: FusedMetrics) {
     Card(
         shape = RoundedCornerShape(20.dp),
         elevation = CardDefaults.cardElevation(6.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(Modifier.padding(16.dp)) {
@@ -896,14 +821,13 @@ private fun StatRow(label: String, value: String) {
         Text(value, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
     }
 }
-
 @Composable
-fun StatsScreen(viewModel: StepCounterViewModel, padding: PaddingValues) {
+private fun StatsScreen(viewModel: StepCounterViewModel, dailyGoal: Int, padding: PaddingValues) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(padding)
-            .background(Color(0xFFF0F4F8))
+            .background(MaterialTheme.colorScheme.background)
             .verticalScroll(rememberScrollState())
             .padding(16.dp)
     ) {
@@ -916,7 +840,7 @@ fun StatsScreen(viewModel: StepCounterViewModel, padding: PaddingValues) {
                 Text("Weekly Stats", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                 Text("Last 7 days including today", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
             }
-            Icon(Icons.Default.BarChart, contentDescription = null, tint = Color(0xFF4CAF50))
+            Icon(Icons.Default.BarChart, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
         }
         Spacer(Modifier.height(16.dp))
 
@@ -955,7 +879,7 @@ fun StatsScreen(viewModel: StepCounterViewModel, padding: PaddingValues) {
         Card(
             shape = RoundedCornerShape(24.dp),
             elevation = CardDefaults.cardElevation(8.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(Modifier.padding(16.dp)) {
@@ -965,11 +889,10 @@ fun StatsScreen(viewModel: StepCounterViewModel, padding: PaddingValues) {
                     WeeklyProgressBar(
                         day = d.label,
                         steps = d.steps,
-                        goal = viewModel.dailyGoal,
+                        goal = dailyGoal,
                         isToday = d.label == "Today",
                         distanceKm = d.distanceKm,
-                        calories = d.caloriesKcal,
-                        primaryMetric = viewModel.primaryMetric
+                        calories = d.caloriesKcal
                     )
                 }
             }
@@ -977,35 +900,26 @@ fun StatsScreen(viewModel: StepCounterViewModel, padding: PaddingValues) {
         Spacer(Modifier.height(24.dp))
     }
 }
-
 @Composable
 private fun StatCard(title: String, value: String, subtitle: String, modifier: Modifier = Modifier) {
     Card(
         modifier = modifier,
         shape = RoundedCornerShape(24.dp),
         elevation = CardDefaults.cardElevation(8.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White)
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(Modifier.padding(16.dp)) {
             Text(title, style = MaterialTheme.typography.titleMedium, color = Color.Gray)
             Spacer(Modifier.height(4.dp))
             Text(value, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
             Spacer(Modifier.height(2.dp))
-            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = Color(0xFF4CAF50))
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
         }
     }
 }
-
 @Composable
-fun StatusIndicator(viewModel: StepCounterViewModel) {
-    var ticker by remember { mutableStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            delay(100)
-            ticker = System.currentTimeMillis()
-        }
-    }
-    val activityStatus = viewModel.getActivityStatus()
+private fun StatusIndicator(viewModel: StepCounterViewModel) {
+    val activityStatus by rememberUpdatedState(viewModel.getActivityStatus())
 
     Card(
         shape = RoundedCornerShape(12.dp),
@@ -1013,7 +927,7 @@ fun StatusIndicator(viewModel: StepCounterViewModel) {
             containerColor = when (activityStatus) {
                 "Running" -> Color(0xFFE53935)
                 "Fast Walk", "Moving" -> Color(0xFFFF9800)
-                "Walking", "Stepping" -> Color(0xFF4CAF50)
+                "Walking", "Stepping" -> MaterialTheme.colorScheme.primary
                 "Slow Walk" -> Color(0xFF8BC34A)
                 else -> Color(0xFF9E9E9E)
             }
@@ -1050,9 +964,8 @@ fun StatusIndicator(viewModel: StepCounterViewModel) {
         }
     }
 }
-
 @Composable
-fun Header() {
+private fun Header(onSettings: () -> Unit) {
     Row(
         Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,
@@ -1063,12 +976,12 @@ fun Header() {
             Text("Real-time step tracking", style = MaterialTheme.typography.bodyMedium, color = Color.Gray)
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
-            IconButton(onClick = { /* settings */ }, Modifier.clip(CircleShape).background(Color.White)) {
+            IconButton(onClick = onSettings, Modifier.clip(CircleShape).background(MaterialTheme.colorScheme.surface)) {
                 Icon(Icons.Default.Settings, "Settings", tint = Color.Gray)
             }
             Spacer(Modifier.width(8.dp))
             Box(
-                Modifier.size(40.dp).clip(CircleShape).background(Color(0xFF4CAF50)),
+                Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.primary),
                 contentAlignment = Alignment.Center
             ) {
                 Icon(Icons.Default.Person, "User", tint = Color.White)
@@ -1076,45 +989,27 @@ fun Header() {
         }
     }
 }
-
 @Composable
-fun MainCard(viewModel: StepCounterViewModel) {
-    // Calculate progress based on primary metric
-    val progress = if (viewModel.primaryMetric == "steps") {
-        (viewModel.steps / viewModel.dailyGoal.toFloat()).coerceIn(0f, 1f)
-    } else {
-        val goalDist = distanceFromSteps(viewModel.dailyGoal)
-        val currentDist = distanceFromSteps(viewModel.steps)
-        (currentDist / goalDist).toFloat().coerceIn(0f, 1f)
-    }
-
+private fun MainCard(viewModel: StepCounterViewModel, dailyGoal: Int) {
+    val progress = (viewModel.steps / dailyGoal.toFloat()).coerceIn(0f, 1f)
     Card(
         shape = RoundedCornerShape(24.dp),
         elevation = CardDefaults.cardElevation(8.dp),
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color.White)
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Box {
             Column(Modifier.padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                DateAndGoal(
-                    goalText = viewModel.getPrimaryGoal(),
-                    metric = viewModel.primaryMetric,
-                    onToggle = { viewModel.togglePrimaryMetric() }
-                )
+                DateAndGoal(dailyGoal)
                 Spacer(Modifier.height(24.dp))
-                CircularProgress(
-                    progress = progress,
-                    centerText = viewModel.getPrimaryValue(viewModel.steps),
-                    centerLabel = viewModel.getPrimaryLabel(),
-                    subtitle = "${(progress * 100).toInt()}% of goal"
-                )
+                CircularProgress(progress, viewModel.steps)
                 Spacer(Modifier.height(24.dp))
-                StatsInline(viewModel.steps, viewModel.primaryMetric)
+                StatsInline(viewModel.steps)
             }
             FloatingActionButton(
                 onClick = { /* sync placeholder */ },
                 modifier = Modifier.align(Alignment.BottomEnd).padding(16.dp),
-                containerColor = Color(0xFF4CAF50),
+                containerColor = MaterialTheme.colorScheme.primary,
                 shape = CircleShape
             ) {
                 Icon(Icons.Default.Sync, "Sync", tint = Color.White)
@@ -1122,118 +1017,82 @@ fun MainCard(viewModel: StepCounterViewModel) {
         }
     }
 }
-
 @Composable
-fun DateAndGoal(goalText: String, metric: String, onToggle: () -> Unit) {
+private fun DateAndGoal(dailyGoal: Int) {
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
         Column {
             Text("Today", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             Text(formatDisplayDate(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
         }
         Column(horizontalAlignment = Alignment.End) {
-            // Toggle button
-            Button(
-                onClick = onToggle,
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE0F7FA)),
-                shape = RoundedCornerShape(12.dp),
-                modifier = Modifier.padding(bottom = 4.dp)
-            ) {
-                Text(
-                    if (metric == "steps") "Show Distance" else "Show Steps",
-                    style = MaterialTheme.typography.labelSmall
-                )
-            }
             Text("Daily Goal", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
             Text(
-                goalText,
+                "%,d steps".format(dailyGoal),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold,
-                color = Color(0xFF4CAF50)
+                color = MaterialTheme.colorScheme.primary
             )
         }
     }
 }
-
 @Composable
-fun CircularProgress(progress: Float, centerText: String, centerLabel: String, subtitle: String) {
+private fun CircularProgress(progress: Float, steps: Int) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+
     Box(Modifier.size(200.dp), contentAlignment = Alignment.Center) {
         Canvas(Modifier.fillMaxSize()) {
             val stroke = 10.dp.toPx()
             drawArc(Color(0xFFE0E0E0), -90f, 360f, useCenter = false, style = Stroke(stroke))
             drawArc(
-                Color(0xFF4CAF50),
-                -90f,
-                360f * progress,
+                color = primaryColor,
+                startAngle = -90f,
+                sweepAngle = 360f * progress,
                 useCenter = false,
                 style = Stroke(stroke, cap = StrokeCap.Round)
             )
         }
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(centerLabel, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-            Text(centerText, style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
+            Text("Steps", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            Text("%,d".format(steps), style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Bold)
             Text(
-                subtitle,
+                "${(progress * 100).toInt()}% of goal",
+                color = primaryColor,
                 style = MaterialTheme.typography.bodyMedium,
-                color = Color(0xFF4CAF50),
                 fontWeight = FontWeight.Medium
             )
         }
     }
 }
-
 @Composable
-fun StatsInline(steps: Int, primaryMetric: String) {
+private fun StatsInline(steps: Int) {
     val distance = distanceFromSteps(steps)
     val calories = caloriesFromSteps(steps)
     val activeMin = steps / 100
     Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceAround) {
-        StatItem(
-            "Distance",
-            "%.2f km".format(distance),
-            isHighlighted = primaryMetric == "distance"
-        )
-        StatItem(
-            "Calories",
-            "%.0f kcal".format(calories)
-        )
-        StatItem(
-            "Active Min",
-            "$activeMin min"
-        )
+        StatItem("Distance", "%.2f km".format(distance))
+        StatItem("Calories", "%.0f kcal".format(calories))
+        StatItem("Active Min", "$activeMin min")
     }
 }
-
 @Composable
-fun StatItem(label: String, value: String, isHighlighted: Boolean = false) {
+private fun StatItem(label: String, value: String) {
     Card(
         shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isHighlighted) Color(0xFFE8F5E9) else Color(0xFFF5F5F5)
-        )
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.background)
     ) {
         Column(Modifier.padding(8.dp, 12.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Text(
-                label,
-                style = MaterialTheme.typography.bodySmall,
-                color = if (isHighlighted) Color(0xFF4CAF50) else Color.Gray
-            )
-            Text(
-                value,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = FontWeight.Bold,
-                color = if (isHighlighted) Color(0xFF2E7D32) else Color.Unspecified
-            )
+            Text(label, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            Text(value, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.Bold)
         }
     }
 }
-
 @Composable
-fun HistorySection(viewModel: StepCounterViewModel, onViewAll: () -> Unit) {
+private fun HistorySection(viewModel: StepCounterViewModel, dailyGoal: Int, onViewAll: () -> Unit) {
     Card(
         shape = RoundedCornerShape(24.dp),
         elevation = CardDefaults.cardElevation(8.dp),
         modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(containerColor = Color.White)
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(Modifier.padding(16.dp)) {
             Row(
@@ -1243,7 +1102,7 @@ fun HistorySection(viewModel: StepCounterViewModel, onViewAll: () -> Unit) {
             ) {
                 Text("Weekly Progress", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                 TextButton(onClick = onViewAll) {
-                    Text("View All", color = Color(0xFF4CAF50), fontWeight = FontWeight.Medium)
+                    Text("View All", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Medium)
                 }
             }
             Spacer(Modifier.height(16.dp))
@@ -1251,34 +1110,25 @@ fun HistorySection(viewModel: StepCounterViewModel, onViewAll: () -> Unit) {
                 WeeklyProgressBar(
                     day = day.label,
                     steps = day.steps,
-                    goal = viewModel.dailyGoal,
+                    goal = dailyGoal,
                     isToday = day.label == "Today",
                     distanceKm = day.distanceKm,
-                    calories = day.caloriesKcal,
-                    primaryMetric = viewModel.primaryMetric
+                    calories = day.caloriesKcal
                 )
             }
         }
     }
 }
-
 @Composable
-fun WeeklyProgressBar(
+private fun WeeklyProgressBar(
     day: String,
     steps: Int,
     goal: Int,
     isToday: Boolean = false,
     distanceKm: Double,
-    calories: Double,
-    primaryMetric: String
+    calories: Double
 ) {
-    val prog = if (primaryMetric == "steps") {
-        (steps / goal.toFloat()).coerceIn(0f, 1f)
-    } else {
-        val goalDist = distanceFromSteps(goal)
-        (distanceKm / goalDist).toFloat().coerceIn(0f, 1f)
-    }
-
+    val prog = (steps / goal.toFloat()).coerceIn(0f, 1f)
     Row(Modifier.fillMaxWidth().padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         Text(day, Modifier.width(60.dp), color = Color.Gray, style = MaterialTheme.typography.bodyMedium)
         Column(Modifier.weight(1f)) {
@@ -1287,14 +1137,14 @@ fun WeeklyProgressBar(
                     .fillMaxWidth()
                     .height(16.dp)
                     .clip(CircleShape)
-                    .background(Color(0xFFE0E0E0))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
             ) {
                 Box(
                     Modifier
                         .fillMaxWidth(prog)
                         .height(16.dp)
                         .clip(CircleShape)
-                        .background(if (isToday) Color(0xFF4CAF50) else Color(0xFF81C784))
+                        .background(if (isToday) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary)
                 )
             }
             Spacer(Modifier.height(2.dp))
@@ -1305,23 +1155,18 @@ fun WeeklyProgressBar(
             )
         }
         Column(horizontalAlignment = Alignment.End, modifier = Modifier.width(90.dp)) {
-            Text(
-                if (primaryMetric == "steps") "%,d".format(steps) else "%.2f".format(distanceKm),
-                textAlign = TextAlign.End,
-                fontWeight = FontWeight.Medium
-            )
+            Text("%,d".format(steps), textAlign = TextAlign.End, fontWeight = FontWeight.Medium)
         }
     }
 }
-
 @Composable
-fun BottomNavigationBar(
+private fun BottomNavigationBar(
     selectedIndex: Int,
     onSelected: (Int) -> Unit
 ) {
-    val items = listOf("Home", "Stats", "Challenges", "Profile")
-    val icons = listOf(Icons.Default.Home, Icons.Default.BarChart, Icons.Default.EmojiEvents, Icons.Default.Person)
-    NavigationBar(containerColor = Color.White) {
+    val items = listOf("Home", "Stats", "Challenges", "Profile", "Settings")
+    val icons = listOf(Icons.Default.Home, Icons.Default.BarChart, Icons.Default.EmojiEvents, Icons.Default.Person, Icons.Default.Settings)
+    NavigationBar(containerColor = MaterialTheme.colorScheme.surface) {
         items.forEachIndexed { i, label ->
             NavigationBarItem(
                 icon = { Icon(icons[i], label) },
@@ -1329,9 +1174,9 @@ fun BottomNavigationBar(
                 selected = selectedIndex == i,
                 onClick = { onSelected(i) },
                 colors = NavigationBarItemDefaults.colors(
-                    selectedIconColor = Color(0xFF4CAF50),
-                    selectedTextColor = Color(0xFF4CAF50),
-                    indicatorColor = Color(0xFFE8F5E9),
+                    selectedIconColor = MaterialTheme.colorScheme.primary,
+                    selectedTextColor = MaterialTheme.colorScheme.primary,
+                    indicatorColor = MaterialTheme.colorScheme.surfaceVariant,
                     unselectedIconColor = Color.Gray,
                     unselectedTextColor = Color.Gray
                 )
@@ -1341,12 +1186,12 @@ fun BottomNavigationBar(
 }
 
 @Composable
-fun PlaceholderScreen(title: String, padding: PaddingValues) {
+private fun PlaceholderScreen(title: String, padding: PaddingValues) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(padding)
-            .background(Color(0xFFF0F4F8)),
+            .background(MaterialTheme.colorScheme.background),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center
     ) {
